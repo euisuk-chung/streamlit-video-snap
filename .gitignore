@@ -208,3 +208,6 @@ __marimo__/
 
 # Windows reserved filenames
 nul
+
+# Claude Code
+.claude/
