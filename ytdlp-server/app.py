@@ -1,17 +1,66 @@
-from flask import Flask, request, jsonify, Response, stream_with_context
+from flask import Flask, request, jsonify, Response, stream_with_context, send_file
 from flask_cors import CORS
 import yt_dlp
 import logging
 import re
-import os
+import requests as http_requests
+from urllib.parse import quote
 import tempfile
-from pathlib import Path
+import os
+import threading
+import time
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Progress tracking storage
+download_progress = {}
+progress_lock = threading.Lock()
+
+
+class ProgressHook:
+    """Progress hook for yt-dlp to track download progress"""
+    def __init__(self, video_id):
+        self.video_id = video_id
+
+    def __call__(self, d):
+        with progress_lock:
+            if d['status'] == 'downloading':
+                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                downloaded = d.get('downloaded_bytes', 0)
+                speed = d.get('speed', 0) or 0
+                eta = d.get('eta', 0) or 0
+
+                if total > 0:
+                    percent = (downloaded / total) * 100
+                else:
+                    percent = 0
+
+                download_progress[self.video_id] = {
+                    'status': 'downloading',
+                    'percent': round(percent, 1),
+                    'downloaded': downloaded,
+                    'total': total,
+                    'speed': speed,
+                    'eta': eta,
+                    'updated_at': time.time()
+                }
+            elif d['status'] == 'finished':
+                download_progress[self.video_id] = {
+                    'status': 'processing',
+                    'percent': 100,
+                    'message': 'Converting to MP3...',
+                    'updated_at': time.time()
+                }
+            elif d['status'] == 'error':
+                download_progress[self.video_id] = {
+                    'status': 'error',
+                    'message': str(d.get('error', 'Unknown error')),
+                    'updated_at': time.time()
+                }
 
 def extract_video_id(url):
     """Extract YouTube video ID from various URL formats"""
@@ -36,6 +85,49 @@ def extract_video_id(url):
 def health():
     """Health check endpoint"""
     return jsonify({'status': 'ok', 'service': 'yt-dlp-api'}), 200
+
+
+@app.route('/api/progress/<video_id>', methods=['GET'])
+def get_progress(video_id):
+    """Get download progress for a video"""
+    with progress_lock:
+        if video_id in download_progress:
+            progress = download_progress[video_id].copy()
+            # Clean up old entries (older than 5 minutes)
+            current_time = time.time()
+            if current_time - progress.get('updated_at', 0) > 300:
+                del download_progress[video_id]
+                return jsonify({'status': 'not_found'}), 404
+            return jsonify(progress), 200
+        return jsonify({'status': 'not_found'}), 404
+
+
+@app.route('/api/debug/<video_id>', methods=['GET'])
+def debug_formats(video_id):
+    """Debug endpoint to see available formats"""
+    try:
+        youtube_url = f'https://www.youtube.com/watch?v={video_id}'
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            formats = []
+            for fmt in info.get('formats', []):
+                formats.append({
+                    'format_id': fmt.get('format_id'),
+                    'ext': fmt.get('ext'),
+                    'acodec': fmt.get('acodec'),
+                    'vcodec': fmt.get('vcodec'),
+                    'protocol': fmt.get('protocol'),
+                    'abr': fmt.get('abr'),
+                    'url_prefix': fmt.get('url', '')[:100] if fmt.get('url') else None,
+                })
+            return jsonify({'formats': formats}), 200
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/audio', methods=['POST'])
 def get_audio():
@@ -72,12 +164,26 @@ def get_audio():
             # Find best audio format
             audio_format = None
             if info.get('formats'):
+                # First try direct HTTPS formats
+                audio_formats = []
                 for fmt in info['formats']:
-                    if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
-                        audio_format = fmt
-                        break
+                    protocol = fmt.get('protocol', '')
+                    if protocol in ('https', 'http'):
+                        if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                            audio_formats.append(fmt)
 
-                # Fallback to best format with audio
+                if audio_formats:
+                    audio_formats.sort(key=lambda x: x.get('abr', 0) or 0, reverse=True)
+                    audio_format = audio_formats[0]
+
+                # Fallback: any audio format (including DASH/HLS)
+                if not audio_format:
+                    for fmt in info['formats']:
+                        if fmt.get('acodec') != 'none' and fmt.get('vcodec') == 'none':
+                            audio_format = fmt
+                            break
+
+                # Last fallback: any format with audio
                 if not audio_format:
                     for fmt in info['formats']:
                         if fmt.get('acodec') != 'none':
@@ -87,15 +193,18 @@ def get_audio():
             if not audio_format:
                 return jsonify({'error': 'No audio format found'}), 404
 
+            # Determine proper MIME type - will be converted to MP3 by stream/download
+            ext = 'mp3'  # yt-dlp will convert to MP3
+            mime_type = 'audio/mpeg'
+
             response_data = {
                 'success': True,
                 'videoId': video_id,
                 'title': info.get('title', 'Unknown'),
                 'duration': info.get('duration', 0),
-                'audioUrl': audio_format.get('url'),
-                'extension': audio_format.get('ext', 'webm'),
-                'mimeType': audio_format.get('format_note', 'audio/webm'),
-                'quality': audio_format.get('quality', 'unknown'),
+                'extension': ext,
+                'mimeType': mime_type,
+                'quality': audio_format.get('format_note', 'unknown'),
                 'abr': audio_format.get('abr', 0),  # Audio bitrate
                 'asr': audio_format.get('asr', 0),  # Audio sample rate
                 'filesize': audio_format.get('filesize', 0),
@@ -284,6 +393,199 @@ def get_transcript():
     except Exception as e:
         logger.error(f'Error fetching transcript: {str(e)}')
         return jsonify({'error': f'Failed to fetch transcript: {str(e)}'}), 500
+
+@app.route('/api/audio/stream/<video_id>', methods=['GET'])
+def stream_audio(video_id):
+    """Stream audio from YouTube using yt-dlp download"""
+    try:
+        if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+            return jsonify({'error': 'Invalid video ID'}), 400
+
+        youtube_url = f'https://www.youtube.com/watch?v={video_id}'
+        logger.info(f'Streaming audio for video: {video_id}')
+
+        # Initialize progress
+        with progress_lock:
+            download_progress[video_id] = {
+                'status': 'starting',
+                'percent': 0,
+                'updated_at': time.time()
+            }
+
+        # Create temp file for audio
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, f'{video_id}.%(ext)s')
+
+        progress_hook = ProgressHook(video_id)
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'progress_hooks': [progress_hook],
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+
+        # Find the downloaded file
+        audio_file = None
+        for f in os.listdir(temp_dir):
+            if f.startswith(video_id):
+                audio_file = os.path.join(temp_dir, f)
+                break
+
+        if not audio_file or not os.path.exists(audio_file):
+            return jsonify({'error': 'Failed to download audio'}), 500
+
+        # Get file size for Content-Length header
+        file_size = os.path.getsize(audio_file)
+        ext = os.path.splitext(audio_file)[1].lstrip('.')
+
+        mime_map = {
+            'm4a': 'audio/mp4',
+            'mp4': 'audio/mp4',
+            'mp3': 'audio/mpeg',
+            'webm': 'audio/webm',
+            'opus': 'audio/opus',
+            'ogg': 'audio/ogg',
+        }
+        mime_type = mime_map.get(ext, 'audio/mpeg')
+
+        # Update progress to complete
+        with progress_lock:
+            download_progress[video_id] = {
+                'status': 'complete',
+                'percent': 100,
+                'updated_at': time.time()
+            }
+
+        # Use send_file for proper Content-Length header (required by st.audio)
+        response = send_file(
+            audio_file,
+            mimetype=mime_type,
+            as_attachment=False,
+            download_name=f'{video_id}.{ext}'
+        )
+
+        # Clean up temp file after response is sent
+        @response.call_on_close
+        def cleanup():
+            try:
+                os.remove(audio_file)
+                os.rmdir(temp_dir)
+            except:
+                pass
+            # Clean up progress after a delay
+            with progress_lock:
+                if video_id in download_progress:
+                    del download_progress[video_id]
+
+        return response
+
+    except Exception as e:
+        logger.error(f'Error streaming audio: {str(e)}')
+        with progress_lock:
+            download_progress[video_id] = {
+                'status': 'error',
+                'message': str(e),
+                'updated_at': time.time()
+            }
+        return jsonify({'error': f'Failed to stream audio: {str(e)}'}), 500
+
+
+@app.route('/api/audio/download/<video_id>', methods=['GET'])
+def download_audio(video_id):
+    """Download audio file from YouTube using yt-dlp"""
+    try:
+        if not re.match(r'^[a-zA-Z0-9_-]{11}$', video_id):
+            return jsonify({'error': 'Invalid video ID'}), 400
+
+        youtube_url = f'https://www.youtube.com/watch?v={video_id}'
+        logger.info(f'Downloading audio for video: {video_id}')
+
+        # Create temp file for audio
+        temp_dir = tempfile.mkdtemp()
+        output_template = os.path.join(temp_dir, f'{video_id}.%(ext)s')
+
+        ydl_opts = {
+            'format': 'bestaudio/best',
+            'outtmpl': output_template,
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+        }
+
+        # Get video info for title
+        with yt_dlp.YoutubeDL({'quiet': True}) as ydl:
+            info = ydl.extract_info(youtube_url, download=False)
+            title = info.get('title', 'audio')
+
+        # Download audio
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+
+        # Find the downloaded file
+        audio_file = None
+        for f in os.listdir(temp_dir):
+            if f.startswith(video_id):
+                audio_file = os.path.join(temp_dir, f)
+                break
+
+        if not audio_file or not os.path.exists(audio_file):
+            return jsonify({'error': 'Failed to download audio'}), 500
+
+        # Sanitize filename
+        safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
+        if not safe_title:
+            safe_title = video_id
+        ext = os.path.splitext(audio_file)[1].lstrip('.')
+
+        mime_map = {
+            'm4a': 'audio/mp4',
+            'mp4': 'audio/mp4',
+            'mp3': 'audio/mpeg',
+            'webm': 'audio/webm',
+            'opus': 'audio/opus',
+            'ogg': 'audio/ogg',
+        }
+        mime_type = mime_map.get(ext, 'audio/mpeg')
+
+        # Use send_file for proper Content-Length header
+        response = send_file(
+            audio_file,
+            mimetype=mime_type,
+            as_attachment=True,
+            download_name=f'{safe_title}.{ext}'
+        )
+
+        # Clean up temp file after response is sent
+        @response.call_on_close
+        def cleanup():
+            try:
+                os.remove(audio_file)
+                os.rmdir(temp_dir)
+            except:
+                pass
+
+        return response
+
+    except Exception as e:
+        logger.error(f'Error downloading audio: {str(e)}')
+        return jsonify({'error': f'Failed to download audio: {str(e)}'}), 500
+
 
 if __name__ == '__main__':
     # For local development only

@@ -1,6 +1,7 @@
 import streamlit as st
 import requests
 import re
+import time
 from io import BytesIO
 
 # Page configuration
@@ -10,8 +11,42 @@ st.set_page_config(
     layout="wide"
 )
 
-# API endpoint (localhost for Docker)
-API_URL = "http://localhost:8080"
+# API endpoint
+API_URL = "http://192.168.45.199:8080"
+
+
+def get_download_progress(video_id):
+    """Get download progress from API"""
+    try:
+        response = requests.get(
+            f"{API_URL}/api/progress/{video_id}",
+            timeout=5
+        )
+        if response.status_code == 200:
+            return response.json()
+        return None
+    except:
+        return None
+
+
+def format_bytes(bytes_val):
+    """Format bytes to human readable string"""
+    if bytes_val < 1024:
+        return f"{bytes_val} B"
+    elif bytes_val < 1024 * 1024:
+        return f"{bytes_val / 1024:.1f} KB"
+    else:
+        return f"{bytes_val / (1024 * 1024):.1f} MB"
+
+
+def format_speed(speed):
+    """Format download speed"""
+    if speed < 1024:
+        return f"{speed:.0f} B/s"
+    elif speed < 1024 * 1024:
+        return f"{speed / 1024:.1f} KB/s"
+    else:
+        return f"{speed / (1024 * 1024):.1f} MB/s"
 
 def extract_audio_info(video_url):
     """Extract audio information from video URL"""
@@ -201,7 +236,7 @@ def audio_tab():
 
                     if "error" in audio_data:
                         st.error(f"Error extracting audio: {audio_data['error']}")
-                    elif audio_data.get("audioUrl"):
+                    elif audio_data.get("videoId"):
                         st.success("Audio extracted successfully!")
 
                         # Display audio information
@@ -226,22 +261,112 @@ def audio_tab():
                                 else:
                                     st.write("**File Size:** N/A")
 
-                        # Audio player
+                        # Audio player using proxy stream
                         st.subheader("🔊 Audio Player")
-                        audio_url = audio_data["audioUrl"]
+                        video_id = audio_data.get("videoId")
+
+                        # Use proxy URL instead of direct YouTube URL
+                        stream_url = f"{API_URL}/api/audio/stream/{video_id}"
+
+                        # Download audio with progress tracking
+                        progress_bar = st.progress(0, text="Preparing to download...")
+                        status_text = st.empty()
 
                         try:
-                            # Use st.audio with the direct URL
-                            st.audio(audio_url)
+                            # Start streaming request in a thread-like manner
+                            # The API will start downloading, we poll progress
+                            import threading
+                            import queue
 
-                            # Provide download link
-                            st.markdown(f"[⬇️ Download Audio]({audio_url})")
+                            result_queue = queue.Queue()
+
+                            def download_audio():
+                                try:
+                                    response = requests.get(stream_url, timeout=600)
+                                    result_queue.put(('success', response.content))
+                                except Exception as e:
+                                    result_queue.put(('error', str(e)))
+
+                            # Start download in background
+                            download_thread = threading.Thread(target=download_audio)
+                            download_thread.start()
+
+                            # Poll for progress while downloading
+                            last_status = ""
+                            while download_thread.is_alive():
+                                progress = get_download_progress(video_id)
+
+                                if progress:
+                                    status = progress.get('status', '')
+                                    percent = progress.get('percent', 0)
+
+                                    if status == 'downloading':
+                                        downloaded = progress.get('downloaded', 0)
+                                        total = progress.get('total', 0)
+                                        speed = progress.get('speed', 0)
+                                        eta = progress.get('eta', 0)
+
+                                        progress_text = f"Downloading: {percent:.1f}%"
+                                        if total > 0:
+                                            progress_text += f" ({format_bytes(downloaded)} / {format_bytes(total)})"
+                                        if speed > 0:
+                                            progress_text += f" - {format_speed(speed)}"
+                                        if eta > 0:
+                                            mins, secs = divmod(int(eta), 60)
+                                            if mins > 0:
+                                                progress_text += f" - ETA: {mins}m {secs}s"
+                                            else:
+                                                progress_text += f" - ETA: {secs}s"
+
+                                        progress_bar.progress(min(percent / 100, 0.95), text=progress_text)
+                                        last_status = status
+
+                                    elif status == 'processing':
+                                        progress_bar.progress(0.97, text="Converting to MP3...")
+                                        last_status = status
+
+                                    elif status == 'complete':
+                                        progress_bar.progress(0.99, text="Finalizing...")
+                                        last_status = status
+
+                                elif last_status == "":
+                                    status_text.text("Waiting for server to start processing...")
+
+                                time.sleep(0.3)
+
+                            # Get result
+                            download_thread.join()
+                            result_type, result_data = result_queue.get()
+
+                            if result_type == 'success':
+                                progress_bar.progress(1.0, text="Complete!")
+                                time.sleep(0.3)
+                                progress_bar.empty()
+                                status_text.empty()
+
+                                # Display audio player
+                                st.audio(result_data, format='audio/mpeg')
+
+                                # Download button
+                                title = audio_data.get('title', video_id)
+                                safe_title = "".join([c for c in title if c.isalnum() or c in (' ', '-', '_')]).strip()
+                                st.download_button(
+                                    label="⬇️ Download Audio",
+                                    data=result_data,
+                                    file_name=f"{safe_title}.mp3",
+                                    mime="audio/mpeg"
+                                )
+                            else:
+                                progress_bar.empty()
+                                status_text.empty()
+                                st.error(f"Error loading audio: {result_data}")
 
                         except Exception as e:
-                            st.error(f"Error playing audio: {str(e)}")
-                            st.info(f"You can still try to play it directly: {audio_url}")
+                            progress_bar.empty()
+                            status_text.empty()
+                            st.error(f"Error loading audio: {str(e)}")
                     else:
-                        st.error("No audio URL found in the response")
+                        st.error("No video ID found in the response")
 
     elif extract_button and not video_url:
         st.warning("Please enter a YouTube URL")

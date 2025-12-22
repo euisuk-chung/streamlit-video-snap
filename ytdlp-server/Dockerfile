@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Install yt-dlp and Flask
-RUN pip install --no-cache-dir yt-dlp flask flask-cors gunicorn
+RUN pip install --no-cache-dir yt-dlp flask flask-cors gunicorn requests
 
 # Create app directory
 WORKDIR /app
@@ -17,5 +17,5 @@ COPY app.py .
 # Expose port
 EXPOSE 8080
 
-# Run with gunicorn
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "2", "--timeout", "120", "app:app"]
+# Run with gunicorn (increased timeout for long videos)
+CMD ["gunicorn", "--bind", "0.0.0.0:8080", "--workers", "4", "--threads", "2", "--timeout", "600", "app:app"]
