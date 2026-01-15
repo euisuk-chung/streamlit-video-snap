@@ -5,14 +5,16 @@ RUN apt-get update && apt-get install -y \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Install yt-dlp and Flask
-RUN pip install --no-cache-dir yt-dlp flask flask-cors gunicorn requests
+# Install yt-dlp, Flask, and LLM dependencies
+RUN pip install --no-cache-dir yt-dlp flask flask-cors gunicorn requests \
+    openai anthropic google-generativeai pyyaml
 
 # Create app directory
 WORKDIR /app
 
 # Copy application files
 COPY app.py .
+COPY llm_service.py .
 
 # Expose port
 EXPOSE 8080

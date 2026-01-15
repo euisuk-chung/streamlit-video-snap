@@ -388,6 +388,86 @@ def get_transcript(video_url):
     except requests.exceptions.RequestException as e:
         return {"error": f"API request failed: {str(e)}"}
 
+
+# ===== LLM API Functions =====
+
+def get_llm_status():
+    """Get LLM provider availability status"""
+    try:
+        response = requests.get(f"{API_URL}/api/llm/status", timeout=5)
+        if response.status_code == 200:
+            return response.json()
+        return {}
+    except:
+        return {}
+
+
+def get_llm_providers():
+    """Get available LLM providers and models"""
+    try:
+        response = requests.get(f"{API_URL}/api/llm/providers", timeout=5)
+        if response.status_code == 200:
+            return response.json().get("providers", [])
+        return []
+    except:
+        return []
+
+
+def summarize_transcript_api(text=None, url=None, provider=None, model=None, language="ko"):
+    """Summarize transcript text using LLM API"""
+    try:
+        payload = {"language": language}
+        if text:
+            payload["text"] = text
+        if url:
+            payload["url"] = url
+        if provider:
+            payload["provider"] = provider
+        if model:
+            payload["model"] = model
+
+        response = requests.post(
+            f"{API_URL}/api/summarize/transcript",
+            json=payload,
+            timeout=120
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            error_data = response.json()
+            return {"error": error_data.get("error", "Unknown error")}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"API request failed: {str(e)}"}
+
+
+def summarize_audio_api(url, mode="whisper", provider=None, model=None, language="ko"):
+    """Summarize audio using LLM API"""
+    try:
+        payload = {
+            "url": url,
+            "mode": mode,
+            "language": language
+        }
+        if provider:
+            payload["provider"] = provider
+        if model:
+            payload["model"] = model
+
+        response = requests.post(
+            f"{API_URL}/api/summarize/audio",
+            json=payload,
+            timeout=300  # 5 minutes for audio processing
+        )
+
+        if response.status_code == 200:
+            return response.json()
+        else:
+            error_data = response.json()
+            return {"error": error_data.get("error", "Unknown error")}
+    except requests.exceptions.RequestException as e:
+        return {"error": f"API request failed: {str(e)}"}
+
 def transcript_tab():
     """Transcript extraction tab"""
     st.header("📝 Transcript Extractor")
@@ -468,8 +548,187 @@ def transcript_tab():
                 with st.expander("View Transcript", expanded=True):
                     st.text_area("Content", full_text, height=400)
 
+                # AI Summary section
+                st.divider()
+                st.subheader("🤖 AI Summary")
+
+                # Store transcript in session state for summarization
+                st.session_state['transcript_text'] = full_text
+                st.session_state['transcript_video_id'] = trans_data.get('videoId')
+
+                if st.button("✨ Summarize with AI", key="summarize_trans_btn", type="secondary"):
+                    provider = st.session_state.get('selected_provider', 'openai')
+                    model = st.session_state.get('selected_model')
+
+                    with st.spinner("Generating summary..."):
+                        result = summarize_transcript_api(
+                            text=full_text,
+                            provider=provider,
+                            model=model,
+                            language="ko"
+                        )
+
+                    if "error" in result:
+                        st.error(f"❌ Summarization failed: {result['error']}")
+                    else:
+                        st.success(f"✅ Summary generated! (Model: {result.get('model', 'unknown')})")
+                        st.markdown(result.get('summary', ''))
+
+                        # Download summary
+                        st.download_button(
+                            label="⬇️ Download Summary",
+                            data=result.get('summary', ''),
+                            file_name=f"summary_{trans_data.get('videoId')}.md",
+                            mime="text/markdown"
+                        )
+
     elif trans_button and not video_url:
         st.warning("Please enter a YouTube URL")
+
+
+def ai_summary_tab():
+    """AI Summary tab - dedicated summarization interface"""
+    st.header("🤖 AI Summary")
+    st.markdown("Generate AI-powered summaries from YouTube videos")
+
+    col1, col2 = st.columns([3, 1])
+
+    with col1:
+        video_url = st.text_input(
+            "YouTube URL",
+            placeholder="https://www.youtube.com/watch?v=...",
+            help="Paste a YouTube video URL",
+            key="ai_url"
+        )
+
+    with col2:
+        st.write("")
+        st.write("")
+        summary_mode = st.selectbox(
+            "Mode",
+            ["Transcript", "Audio (Whisper)", "Audio (Multimodal)"],
+            key="ai_mode"
+        )
+
+    # Advanced settings
+    with st.expander("Advanced Settings"):
+        col_prov, col_model, col_lang = st.columns(3)
+
+        providers = get_llm_providers()
+        provider_names = [p["name"] for p in providers if p.get("available", False)]
+
+        if not provider_names:
+            provider_names = ["OpenAI", "Anthropic", "Google"]
+
+        with col_prov:
+            selected_provider_name = st.selectbox(
+                "Provider",
+                provider_names,
+                key="ai_provider_select"
+            )
+            selected_provider = selected_provider_name.lower()
+
+        with col_model:
+            # Get models for selected provider
+            models = []
+            for p in providers:
+                if p["name"].lower() == selected_provider:
+                    models = [m["name"] for m in p.get("models", [])]
+                    break
+
+            if not models:
+                models = ["Default"]
+
+            selected_model_name = st.selectbox("Model", models, key="ai_model_select")
+
+            # Map model name to ID
+            selected_model = None
+            for p in providers:
+                if p["name"].lower() == selected_provider:
+                    for m in p.get("models", []):
+                        if m["name"] == selected_model_name:
+                            selected_model = m["id"]
+                            break
+
+        with col_lang:
+            language = st.selectbox("Output Language", ["Korean", "English"], key="ai_lang")
+            lang_code = "ko" if language == "Korean" else "en"
+
+    summarize_btn = st.button("✨ Generate Summary", type="primary", use_container_width=True)
+
+    if summarize_btn and video_url:
+        # First get video info
+        with st.spinner("Fetching video info..."):
+            info_data = get_video_info(video_url)
+
+        if "error" not in info_data:
+            st.divider()
+            col_thumb, col_info = st.columns([1, 4])
+            with col_thumb:
+                if info_data.get("thumbnail"):
+                    st.image(info_data["thumbnail"], use_container_width=True)
+            with col_info:
+                st.subheader(info_data.get("title", "Unknown Title"))
+                st.markdown(f"**Duration:** {format_duration(info_data.get('duration'))}")
+
+        # Generate summary based on mode
+        if summary_mode == "Transcript":
+            with st.spinner("Fetching transcript and generating summary..."):
+                result = summarize_transcript_api(
+                    url=video_url,
+                    provider=selected_provider,
+                    model=selected_model,
+                    language=lang_code
+                )
+        else:
+            mode = "whisper" if "Whisper" in summary_mode else "multimodal"
+            with st.spinner(f"Processing audio ({mode})... This may take a few minutes."):
+                result = summarize_audio_api(
+                    url=video_url,
+                    mode=mode,
+                    provider=selected_provider,
+                    model=selected_model,
+                    language=lang_code
+                )
+
+        if "error" in result:
+            st.error(f"❌ Summarization failed: {result['error']}")
+        else:
+            st.success(f"✅ Summary generated! (Model: {result.get('model', 'unknown')})")
+
+            # Show transcription if available (Whisper mode)
+            if result.get("transcription"):
+                with st.expander("View Transcription", expanded=False):
+                    st.text_area("Transcription", result["transcription"], height=200)
+
+            # Show summary
+            st.markdown("### Summary")
+            st.markdown(result.get("summary", ""))
+
+            # Download buttons
+            col_dl1, col_dl2 = st.columns(2)
+            video_id = extract_video_id(video_url)
+
+            with col_dl1:
+                st.download_button(
+                    label="⬇️ Download Summary (Markdown)",
+                    data=result.get("summary", ""),
+                    file_name=f"summary_{video_id}.md",
+                    mime="text/markdown"
+                )
+
+            if result.get("transcription"):
+                with col_dl2:
+                    st.download_button(
+                        label="⬇️ Download Transcription",
+                        data=result.get("transcription", ""),
+                        file_name=f"transcription_{video_id}.txt",
+                        mime="text/plain"
+                    )
+
+    elif summarize_btn and not video_url:
+        st.warning("Please enter a YouTube URL")
+
 
 def main():
     st.title("🎬 YouTube Tools")
@@ -504,17 +763,82 @@ def main():
             st.error("❌ API Server is not running")
             st.info("Start Docker container:\n```bash\ncd ytdlp-server\ndocker-compose up -d\n```")
 
+        st.divider()
+
+        # AI Settings
+        st.subheader("🤖 AI Settings")
+
+        llm_status = get_llm_status()
+        providers = get_llm_providers()
+
+        # Provider selection
+        available_providers = [p for p in providers if p.get("available", False)]
+
+        if available_providers:
+            provider_options = {p["name"]: p["id"] for p in available_providers}
+            selected_provider_name = st.selectbox(
+                "LLM Provider",
+                list(provider_options.keys()),
+                key="sidebar_provider"
+            )
+            st.session_state['selected_provider'] = provider_options[selected_provider_name]
+
+            # Model selection for selected provider
+            selected_provider_data = next(
+                (p for p in available_providers if p["name"] == selected_provider_name),
+                None
+            )
+            if selected_provider_data and selected_provider_data.get("models"):
+                model_options = {m["name"]: m["id"] for m in selected_provider_data["models"]}
+                selected_model_name = st.selectbox(
+                    "Model",
+                    list(model_options.keys()),
+                    key="sidebar_model"
+                )
+                st.session_state['selected_model'] = model_options[selected_model_name]
+        else:
+            st.warning("No LLM providers configured")
+            st.session_state['selected_provider'] = 'openai'
+            st.session_state['selected_model'] = None
+
+        # API Key Status
+        st.markdown("**API Key Status:**")
+        status_cols = st.columns(3)
+        with status_cols[0]:
+            if llm_status.get("openai"):
+                st.markdown("🟢 OpenAI")
+            else:
+                st.markdown("🔴 OpenAI")
+        with status_cols[1]:
+            if llm_status.get("anthropic"):
+                st.markdown("🟢 Anthropic")
+            else:
+                st.markdown("🔴 Anthropic")
+        with status_cols[2]:
+            if llm_status.get("google"):
+                st.markdown("🟢 Google")
+            else:
+                st.markdown("🔴 Google")
+
     # Tabs
-    tab1, tab2, tab3 = st.tabs(["📸 Thumbnail Downloader", "🎵 Audio Extractor", "📝 Transcripts"])
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📸 Thumbnail",
+        "🎵 Audio",
+        "📝 Transcript",
+        "🤖 AI Summary"
+    ])
 
     with tab1:
         thumbnail_tab()
 
     with tab2:
         audio_tab()
-        
+
     with tab3:
         transcript_tab()
+
+    with tab4:
+        ai_summary_tab()
 
 if __name__ == "__main__":
     main()

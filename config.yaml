@@ -1,0 +1,62 @@
+# LLM Configuration for AI Summarization
+llm:
+  default_provider: "openai"
+  output_language: "ko"
+
+  providers:
+    openai:
+      api_key_env: "OPENAI_API_KEY"
+      models:
+        - id: "gpt-4o"
+          name: "GPT-4o"
+          supports_audio: true
+        - id: "gpt-4o-mini"
+          name: "GPT-4o Mini"
+          supports_audio: false
+      whisper_model: "whisper-1"
+
+    anthropic:
+      api_key_env: "ANTHROPIC_API_KEY"
+      models:
+        - id: "claude-sonnet-4-20250514"
+          name: "Claude Sonnet 4"
+          supports_audio: false
+        - id: "claude-3-5-sonnet-20241022"
+          name: "Claude 3.5 Sonnet"
+          supports_audio: false
+
+    google:
+      api_key_env: "GOOGLE_API_KEY"
+      models:
+        - id: "gemini-2.0-flash"
+          name: "Gemini 2.0 Flash"
+          supports_audio: true
+        - id: "gemini-1.5-pro"
+          name: "Gemini 1.5 Pro"
+          supports_audio: true
+
+summarization:
+  max_transcript_length: 100000
+
+  prompts:
+    ko: |
+      다음 YouTube 영상의 내용을 한국어로 요약해주세요.
+
+      요약 형식:
+      1. **주제**: 영상의 핵심 주제 (1-2문장)
+      2. **핵심 내용**: 주요 포인트 3-5개 (불릿 포인트)
+      3. **결론**: 영상의 핵심 메시지 또는 결론 (1-2문장)
+
+      영상 내용:
+      {content}
+
+    en: |
+      Please summarize the following YouTube video content in English.
+
+      Summary format:
+      1. **Topic**: Core topic of the video (1-2 sentences)
+      2. **Key Points**: 3-5 main points (bullet points)
+      3. **Conclusion**: Key message or conclusion (1-2 sentences)
+
+      Video content:
+      {content}

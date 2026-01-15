@@ -9,6 +9,10 @@ import tempfile
 import os
 import threading
 import time
+import uuid
+
+# LLM Service for AI summarization
+from llm_service import LLMService
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -19,6 +23,13 @@ logger = logging.getLogger(__name__)
 # Progress tracking storage
 download_progress = {}
 progress_lock = threading.Lock()
+
+# Summarization task tracking
+summarize_tasks = {}
+summarize_lock = threading.Lock()
+
+# LLM Service instance
+llm_service = LLMService()
 
 
 class ProgressHook:
@@ -585,6 +596,260 @@ def download_audio(video_id):
     except Exception as e:
         logger.error(f'Error downloading audio: {str(e)}')
         return jsonify({'error': f'Failed to download audio: {str(e)}'}), 500
+
+
+# ===== LLM API Endpoints =====
+
+@app.route('/api/llm/status', methods=['GET'])
+def get_llm_status():
+    """Get availability status of all LLM providers"""
+    try:
+        status = llm_service.get_provider_status()
+        return jsonify(status), 200
+    except Exception as e:
+        logger.error(f'Error getting LLM status: {str(e)}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/llm/providers', methods=['GET'])
+def get_llm_providers():
+    """Get list of available LLM providers with their models"""
+    try:
+        providers = llm_service.get_available_providers()
+        return jsonify({'providers': providers}), 200
+    except Exception as e:
+        logger.error(f'Error getting LLM providers: {str(e)}')
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/api/summarize/transcript', methods=['POST'])
+def summarize_transcript():
+    """Summarize video transcript using LLM"""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'Missing request body'}), 400
+
+        # Get transcript text - either from request or fetch from URL
+        text = data.get('text')
+        url = data.get('url')
+
+        if not text and not url:
+            return jsonify({'error': 'Either "text" or "url" is required'}), 400
+
+        # If URL is provided, fetch transcript first
+        if not text and url:
+            # Extract video ID
+            video_id_match = re.search(
+                r'(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})',
+                url
+            )
+            if not video_id_match:
+                return jsonify({'error': 'Invalid YouTube URL'}), 400
+
+            video_id = video_id_match.group(1)
+            video_url = f'https://www.youtube.com/watch?v={video_id}'
+
+            # Fetch transcript using existing logic
+            ydl_opts = {
+                'skip_download': True,
+                'writesubtitles': True,
+                'writeautomaticsub': True,
+                'subtitleslangs': ['ko', 'en'],
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=False)
+
+            preferred_lang = data.get('lang', 'ko')
+            subtitles = info.get('subtitles', {})
+            automatic_captions = info.get('automatic_captions', {})
+
+            transcript_url = None
+            for lang in [preferred_lang, 'en']:
+                if lang in subtitles:
+                    for fmt in subtitles[lang]:
+                        if fmt.get('ext') == 'json3':
+                            transcript_url = fmt.get('url')
+                            break
+                if transcript_url:
+                    break
+
+            if not transcript_url:
+                for lang in [preferred_lang, 'en']:
+                    if lang in automatic_captions:
+                        for fmt in automatic_captions[lang]:
+                            if fmt.get('ext') == 'json3':
+                                transcript_url = fmt.get('url')
+                                break
+                    if transcript_url:
+                        break
+
+            if not transcript_url:
+                return jsonify({'error': 'No transcript available for this video'}), 404
+
+            import urllib.request
+            import json
+            with urllib.request.urlopen(transcript_url) as response:
+                transcript_data = json.loads(response.read().decode('utf-8'))
+
+            segments = []
+            for event in transcript_data.get('events', []):
+                if 'segs' in event:
+                    text_parts = [seg.get('utf8', '') for seg in event['segs']]
+                    segment_text = ''.join(text_parts).strip()
+                    if segment_text:
+                        segments.append(segment_text)
+
+            text = ' '.join(segments)
+
+        if not text:
+            return jsonify({'error': 'No transcript text available'}), 400
+
+        # Get LLM parameters
+        provider = data.get('provider')
+        model = data.get('model')
+        language = data.get('language')
+
+        # Summarize
+        result = llm_service.summarize_transcript(text, provider, model, language)
+
+        if 'error' in result:
+            return jsonify(result), 500
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        logger.error(f'Error summarizing transcript: {str(e)}')
+        return jsonify({'error': f'Failed to summarize: {str(e)}'}), 500
+
+
+@app.route('/api/summarize/audio', methods=['POST'])
+def summarize_audio():
+    """Summarize video audio using LLM (Whisper or Multimodal)"""
+    try:
+        data = request.get_json()
+        if not data or 'url' not in data:
+            return jsonify({'error': 'Missing "url" in request body'}), 400
+
+        url = data['url']
+        mode = data.get('mode', 'whisper')  # 'whisper' or 'multimodal'
+        provider = data.get('provider')
+        model = data.get('model')
+        language = data.get('language')
+
+        # Extract video ID
+        video_id_match = re.search(
+            r'(?:youtube\.com/(?:watch\?v=|embed/|v/|shorts/)|youtu\.be/)([a-zA-Z0-9_-]{11})',
+            url
+        )
+        if not video_id_match:
+            return jsonify({'error': 'Invalid YouTube URL'}), 400
+
+        video_id = video_id_match.group(1)
+        video_url = f'https://www.youtube.com/watch?v={video_id}'
+
+        # Create task ID for tracking
+        task_id = str(uuid.uuid4())
+
+        with summarize_lock:
+            summarize_tasks[task_id] = {
+                'status': 'downloading',
+                'percent': 0,
+                'message': 'Downloading audio...'
+            }
+
+        # Download audio to temp file
+        temp_dir = tempfile.mkdtemp()
+        audio_file = None
+
+        try:
+            def progress_hook(d):
+                with summarize_lock:
+                    if d['status'] == 'downloading':
+                        total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+                        downloaded = d.get('downloaded_bytes', 0)
+                        if total > 0:
+                            percent = int((downloaded / total) * 30)  # 0-30% for download
+                            summarize_tasks[task_id]['percent'] = percent
+                    elif d['status'] == 'finished':
+                        summarize_tasks[task_id]['percent'] = 30
+                        summarize_tasks[task_id]['message'] = 'Processing audio...'
+
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(temp_dir, '%(id)s.%(ext)s'),
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '128',
+                }],
+                'progress_hooks': [progress_hook],
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([video_url])
+
+            # Find the downloaded file
+            for file in os.listdir(temp_dir):
+                if file.endswith('.mp3'):
+                    audio_file = os.path.join(temp_dir, file)
+                    break
+
+            if not audio_file:
+                return jsonify({'error': 'Failed to download audio'}), 500
+
+            # Update status
+            with summarize_lock:
+                if mode == 'whisper':
+                    summarize_tasks[task_id]['status'] = 'transcribing'
+                    summarize_tasks[task_id]['percent'] = 35
+                    summarize_tasks[task_id]['message'] = 'Transcribing audio with Whisper...'
+                else:
+                    summarize_tasks[task_id]['status'] = 'summarizing'
+                    summarize_tasks[task_id]['percent'] = 35
+                    summarize_tasks[task_id]['message'] = 'Analyzing audio with AI...'
+
+            # Summarize audio
+            result = llm_service.summarize_audio(audio_file, mode, provider, model, language)
+
+            with summarize_lock:
+                if 'error' in result:
+                    summarize_tasks[task_id]['status'] = 'error'
+                    summarize_tasks[task_id]['message'] = result['error']
+                else:
+                    summarize_tasks[task_id]['status'] = 'complete'
+                    summarize_tasks[task_id]['percent'] = 100
+                    summarize_tasks[task_id]['message'] = 'Complete'
+
+            if 'error' in result:
+                return jsonify(result), 500
+
+            result['task_id'] = task_id
+            return jsonify(result), 200
+
+        finally:
+            # Clean up temp files
+            try:
+                if audio_file and os.path.exists(audio_file):
+                    os.remove(audio_file)
+                if os.path.exists(temp_dir):
+                    os.rmdir(temp_dir)
+            except:
+                pass
+
+    except Exception as e:
+        logger.error(f'Error summarizing audio: {str(e)}')
+        return jsonify({'error': f'Failed to summarize audio: {str(e)}'}), 500
+
+
+@app.route('/api/summarize/progress/<task_id>', methods=['GET'])
+def get_summarize_progress(task_id):
+    """Get progress of a summarization task"""
+    with summarize_lock:
+        if task_id not in summarize_tasks:
+            return jsonify({'error': 'Task not found'}), 404
+        return jsonify(summarize_tasks[task_id]), 200
 
 
 if __name__ == '__main__':
