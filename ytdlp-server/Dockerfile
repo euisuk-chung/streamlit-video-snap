@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
 
 # Install yt-dlp, Flask, and LLM dependencies
 RUN pip install --no-cache-dir yt-dlp flask flask-cors gunicorn requests \
-    openai anthropic google-generativeai pyyaml
+    openai anthropic google-generativeai pyyaml youtube-transcript-api
 
 # Create app directory
 WORKDIR /app
@@ -15,6 +15,7 @@ WORKDIR /app
 # Copy application files
 COPY app.py .
 COPY llm_service.py .
+COPY config.yaml .
 
 # Expose port
 EXPOSE 8080
