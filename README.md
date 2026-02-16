@@ -113,6 +113,49 @@ The yt-dlp server provides the following endpoints:
 - `POST /api/info` - Get video metadata
 - `POST /api/audio` - Extract audio information and URL
 
+## Auto-Start on Windows Boot
+
+PC 부팅 시 자동으로 서버들이 실행되도록 설정할 수 있습니다.
+
+### 현재 상태
+
+| 서버 | 자동 실행 | 설명 |
+|------|-----------|------|
+| Backend (Docker) | O | `restart: unless-stopped` 설정됨 |
+| Frontend (Streamlit) | O | Windows 시작 프로그램에 등록됨 |
+
+### 자동 실행 구조
+
+- **Backend**: Docker Desktop이 부팅 시 자동 시작되면, `unless-stopped` 정책으로 컨테이너도 자동 시작
+- **Frontend**: `start-streamlit.bat` 파일이 Windows 시작 프로그램에 등록되어 자동 실행
+
+### 자동 실행 관리
+
+#### 시작 프로그램 등록 (최초 설정 시)
+```powershell
+powershell -ExecutionPolicy Bypass -File create-shortcut.ps1
+```
+
+#### 시작 프로그램 해제
+Windows 시작 프로그램 폴더에서 바로가기 삭제:
+```powershell
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\YouTube-Tools-Streamlit.lnk"
+```
+
+또는 `Win + R` → `shell:startup` → `YouTube-Tools-Streamlit.lnk` 삭제
+
+#### 시작 프로그램 폴더 열기
+```
+Win + R → shell:startup
+```
+
+### 관련 파일
+
+| 파일 | 설명 |
+|------|------|
+| `start-streamlit.bat` | Streamlit 실행 배치 파일 |
+| `create-shortcut.ps1` | 시작 프로그램 등록 스크립트 |
+
 ## Troubleshooting
 
 ### API Server Not Running

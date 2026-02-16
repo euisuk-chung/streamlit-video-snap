@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import re
 import time
+import os
 from io import BytesIO
 
 # Page configuration
@@ -11,8 +12,8 @@ st.set_page_config(
     layout="wide"
 )
 
-# API endpoint
-API_URL = "http://192.168.45.199:8080"
+# API endpoint (use environment variable or default to localhost)
+API_URL = os.environ.get("API_URL", "http://localhost:8080")
 
 
 def get_download_progress(video_id):
