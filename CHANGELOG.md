@@ -4,6 +4,15 @@ All notable changes to the **Streamlit Video Snap** project will be documented i
 
 ---
 
+## [0.5.1] - 2026-02-17
+
+### Added
+- **Streamlit LAN 접속 설정**: `.streamlit/config.toml` 추가로 다른 PC에서 안정적인 접속 지원
+  - `server.address = "0.0.0.0"`: 모든 네트워크 인터페이스에서 접속 허용
+  - CORS 및 XSRF 보호 비활성화로 크로스 오리진 문제 해결
+
+---
+
 ## [0.5.0] - 2026-02-16
 
 ### Fixed
